@@ -1,0 +1,163 @@
+# Copy to the PUBLIC builder repo as .github/workflows/release.yml
+# Generic by design: nothing here names the private project. The target repo, decryption key,
+# and PAT all come from Secrets (see builder/SETUP.md). Source ships only inside payload.bin.
+name: Artifact Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  APP_VERSION: 1.0.${{ github.run_number }}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require secrets
+        env:
+          K: ${{ secrets.BUILD_BUNDLE_KEY }}
+          R: ${{ secrets.PRIVATE_RELEASE_REPO }}
+          T: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+        run: |
+          [ -n "$K" ] || { echo "::error::BUILD_BUNDLE_KEY not set"; exit 1; }
+          [ -n "$R" ] || { echo "::error::PRIVATE_RELEASE_REPO not set"; exit 1; }
+          [ -n "$T" ] || { echo "::error::PRIVATE_RELEASE_TOKEN not set"; exit 1; }
+
+  windows:
+    needs: guard
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare source workspace
+        shell: pwsh
+        env:
+          BUILD_BUNDLE_KEY: ${{ secrets.BUILD_BUNDLE_KEY }}
+        run: ./scripts/runtime.ps1 -Dest src
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: Build Tauri (Windows .msi/.exe)
+        working-directory: src/desktop
+        run: |
+          npm install
+          npm run tauri build
+      - name: Build C# app installer (if a winui/ project exists)
+        shell: pwsh
+        run: |
+          if (Test-Path src/winui) {
+            dotnet publish src/winui -c Release -r win-x64 --self-contained false -o csharp-dist
+          } else { Write-Host "No winui/ project yet - skipping." }
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $i = 0
+          # Neutralize asset names (Tauri productName may carry a brand) — keep only version + index + ext.
+          Get-ChildItem -Recurse src/desktop/src-tauri/target -Include *.msi,*.exe -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName ("dist/AppSetup-{0}-{1:D2}{2}" -f $env:APP_VERSION, $i, $_.Extension); $i++ }
+          if (Test-Path csharp-dist) { Compress-Archive csharp-dist/* "dist/AppDesktop-$env:APP_VERSION-win-x64.zip" -Force }
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist }
+
+  linux:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare source workspace
+        shell: pwsh
+        env:
+          BUILD_BUNDLE_KEY: ${{ secrets.BUILD_BUNDLE_KEY }}
+        run: ./scripts/runtime.ps1 -Dest src
+      - name: Tauri Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: Build Tauri (Linux .deb/.AppImage)
+        working-directory: src/desktop
+        run: |
+          npm install
+          npm run tauri build
+      - name: Build & push backend Docker image to GHCR
+        if: github.event_name != 'pull_request' && github.event.repository.fork == false
+        run: |
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG="ghcr.io/${REPO_LC}-backend:$APP_VERSION"
+          docker build -t "$IMG" -t "ghcr.io/${REPO_LC}-backend:latest" src/backend
+          docker push "$IMG"; docker push "ghcr.io/${REPO_LC}-backend:latest"
+          echo "$IMG" > container-image.txt
+      - name: Zip Chrome extension
+        run: (cd src/extension && zip -r "../../extension-$APP_VERSION.zip" .)
+      - name: Build self-signed Android APK (.NET MAUI)
+        run: |
+          if [ -d src/csharp/HuiLetter.Mobile ]; then
+            keytool -genkeypair -keystore "$PWD/ks.keystore" -storepass android -keypass android \
+              -alias k -dname "CN=App" -keyalg RSA -keysize 2048 -validity 3650
+            dotnet workload restore src/csharp/HuiLetter.Mobile/HuiLetter.Mobile.csproj || true
+            dotnet publish src/csharp/HuiLetter.Mobile -f net10.0-android -c Release -o androidout \
+              -p:AndroidKeyStore=true -p:AndroidSigningKeyStore="$PWD/ks.keystore" \
+              -p:AndroidSigningStorePass=android -p:AndroidSigningKeyAlias=k -p:AndroidSigningKeyPass=android \
+              || echo "android build skipped/failed"
+            apk=$(find androidout src/csharp/HuiLetter.Mobile -name "*-Signed.apk" 2>/dev/null | head -1)
+            [ -z "$apk" ] && apk=$(find . -name "*.apk" 2>/dev/null | head -1)
+            [ -n "$apk" ] && cp "$apk" "app-$APP_VERSION.apk" || true
+          else echo "No mobile project - skipping."; fi
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          # Neutralize names (no brand): map by extension.
+          find src/desktop/src-tauri/target -type f \( -name '*.deb' -o -name '*.AppImage' \) \
+            -exec sh -c 'cp "$1" "dist/AppSetup-$APP_VERSION.${1##*.}"' _ {} \; || true
+          cp container-image.txt dist/ 2>/dev/null || true
+          cp extension-$APP_VERSION.zip dist/ 2>/dev/null || true
+          cp app-$APP_VERSION.apk dist/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist }
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - name: Publish release to the private repo
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+          TARGET: ${{ secrets.PRIVATE_RELEASE_REPO }}
+        run: |
+          set -e
+          mkdir -p assets && find artifacts -type f -exec cp {} assets/ \;
+          shopt -s nullglob
+          files=(assets/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::no artifacts to release"; exit 1; fi
+          ls -la assets
+          gh release create "v$APP_VERSION" "${files[@]}" \
+            --repo "$TARGET" --title "Release v$APP_VERSION" --notes "Automated build release." \
+            || gh release upload "v$APP_VERSION" "${files[@]}" --repo "$TARGET" --clobber
+      - name: Job summary
+        run: |
+          {
+            echo "## Build v$APP_VERSION"
+            echo "Released to the private target repo. Artifacts:"
+            echo ""
+            for f in assets/*; do echo "- \`$(basename "$f")\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
