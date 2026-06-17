@@ -177,3 +177,21 @@ jobs:
           if [ ${#files[@]} -eq 0 ]; then echo "no linux files"; exit 0; fi
           gh release upload "v$APP_VERSION" "${files[@]}" --repo "$TARGET" --clobber
           { echo "### Linux/Docker/extension/APK artifacts (v$APP_VERSION)"; for f in "${files[@]}"; do echo "- \`$(basename "$f")\`"; done; } >> "$GITHUB_STEP_SUMMARY"
+
+  # Optional: post a Discord notification when a release finishes. Set the DISCORD_WEBHOOK_URL
+  # secret on THIS builder repo to enable it; it's a no-op (skips) if the secret is absent.
+  notify:
+    needs: [windows, linux]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discord release notification (if webhook secret is set)
+        env:
+          HOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WIN: ${{ needs.windows.result }}
+          LNX: ${{ needs.linux.result }}
+        run: |
+          [ -z "$HOOK" ] && { echo "No DISCORD_WEBHOOK_URL secret - skipping notification."; exit 0; }
+          if [ "$WIN" = "success" ] && [ "$LNX" = "success" ]; then state="succeeded"; else state="finished with issues (win=$WIN linux=$LNX)"; fi
+          curl -fsS -H "Content-Type: application/json" \
+            -d "{\"content\":\"Build v$APP_VERSION $state - release updated.\"}" "$HOOK" || true
