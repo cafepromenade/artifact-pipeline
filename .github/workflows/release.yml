@@ -76,11 +76,18 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          $i = 0
-          # Neutralize asset names (Tauri productName may carry a brand) — keep only version + index + ext.
-          Get-ChildItem -Recurse src/desktop/src-tauri/target -Include *.msi,*.exe -ErrorAction SilentlyContinue |
-            ForEach-Object { Copy-Item $_.FullName ("dist/AppSetup-{0}-{1:D2}{2}" -f $env:APP_VERSION, $i, $_.Extension); $i++ }
+          # ONLY the real installers Tauri emits (NSIS .exe + MSI .msi) live under bundle/ — do NOT
+          # recurse all of target/ (that picks up dozens of tiny build/dependency .exe files, and
+          # -Include + -Recurse also duplicates them). Neutral names (no brand from productName).
+          $bundle = "src/desktop/src-tauri/target/release/bundle"
+          Get-ChildItem "$bundle/nsis" -Filter *.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1 |
+            ForEach-Object { Copy-Item $_.FullName "dist/AppSetup-$env:APP_VERSION-x64-setup.exe" }
+          Get-ChildItem "$bundle/msi" -Filter *.msi -ErrorAction SilentlyContinue |
+            Select-Object -First 1 |
+            ForEach-Object { Copy-Item $_.FullName "dist/AppSetup-$env:APP_VERSION-x64.msi" }
           if (Test-Path csharp-dist) { Compress-Archive csharp-dist/* "dist/AppDesktop-$env:APP_VERSION-win-x64.zip" -Force }
+          "Collected:"; Get-ChildItem dist | Select-Object Name, Length
       - name: Upload to the Release (no Actions artifacts)
         if: github.event.repository.fork == false
         shell: bash
@@ -149,12 +156,16 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p dist
-          # Neutralize names (no brand): map by extension.
-          find src/desktop/src-tauri/target -type f \( -name '*.deb' -o -name '*.AppImage' \) \
-            -exec sh -c 'cp "$1" "dist/AppSetup-$APP_VERSION.${1##*.}"' _ {} \; || true
+          # Real installers live only under bundle/ (deb + appimage). Take one of each; neutral names.
+          b=src/desktop/src-tauri/target/release/bundle
+          deb=$(find "$b/deb" -name '*.deb' 2>/dev/null | head -1)
+          app=$(find "$b/appimage" -name '*.AppImage' 2>/dev/null | head -1)
+          [ -n "$deb" ] && cp "$deb" "dist/AppSetup-$APP_VERSION-amd64.deb" || true
+          [ -n "$app" ] && cp "$app" "dist/AppSetup-$APP_VERSION-x86_64.AppImage" || true
           cp container-image.txt dist/ 2>/dev/null || true
           cp extension-$APP_VERSION.zip dist/ 2>/dev/null || true
           cp app-$APP_VERSION.apk dist/ 2>/dev/null || true
+          echo "Collected:"; ls -la dist
       - name: Upload to the Release (no Actions artifacts)
         if: github.event.repository.fork == false
         env:
