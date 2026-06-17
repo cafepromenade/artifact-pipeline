@@ -28,8 +28,23 @@ jobs:
           [ -n "$R" ] || { echo "::error::PRIVATE_RELEASE_REPO not set"; exit 1; }
           [ -n "$T" ] || { echo "::error::PRIVATE_RELEASE_TOKEN not set"; exit 1; }
 
-  windows:
+  # Create the (empty) Release once, so each build job can upload straight to it — no Actions
+  # artifact storage is used (we attach files to the Release only).
+  release-init:
     needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create / ensure the Release exists
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+          TARGET: ${{ secrets.PRIVATE_RELEASE_REPO }}
+        run: |
+          gh release view "v$APP_VERSION" --repo "$TARGET" >/dev/null 2>&1 || \
+            gh release create "v$APP_VERSION" --repo "$TARGET" \
+              --title "Release v$APP_VERSION" --notes "Automated build release."
+
+  windows:
+    needs: release-init
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +81,21 @@ jobs:
           Get-ChildItem -Recurse src/desktop/src-tauri/target -Include *.msi,*.exe -ErrorAction SilentlyContinue |
             ForEach-Object { Copy-Item $_.FullName ("dist/AppSetup-{0}-{1:D2}{2}" -f $env:APP_VERSION, $i, $_.Extension); $i++ }
           if (Test-Path csharp-dist) { Compress-Archive csharp-dist/* "dist/AppDesktop-$env:APP_VERSION-win-x64.zip" -Force }
-      - uses: actions/upload-artifact@v4
-        with: { name: windows, path: dist }
+      - name: Upload to the Release (no Actions artifacts)
+        if: github.event.repository.fork == false
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+          TARGET: ${{ secrets.PRIVATE_RELEASE_REPO }}
+        run: |
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "no windows files"; exit 0; fi
+          gh release upload "v$APP_VERSION" "${files[@]}" --repo "$TARGET" --clobber
+          { echo "### Windows artifacts (v$APP_VERSION)"; for f in "${files[@]}"; do echo "- \`$(basename "$f")\`"; done; } >> "$GITHUB_STEP_SUMMARY"
 
   linux:
-    needs: guard
+    needs: release-init
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,34 +155,14 @@ jobs:
           cp container-image.txt dist/ 2>/dev/null || true
           cp extension-$APP_VERSION.zip dist/ 2>/dev/null || true
           cp app-$APP_VERSION.apk dist/ 2>/dev/null || true
-      - uses: actions/upload-artifact@v4
-        with: { name: linux, path: dist }
-
-  release:
-    needs: [windows, linux]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { path: artifacts }
-      - name: Publish release to the private repo
+      - name: Upload to the Release (no Actions artifacts)
+        if: github.event.repository.fork == false
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
           TARGET: ${{ secrets.PRIVATE_RELEASE_REPO }}
         run: |
-          set -e
-          mkdir -p assets && find artifacts -type f -exec cp {} assets/ \;
           shopt -s nullglob
-          files=(assets/*)
-          if [ ${#files[@]} -eq 0 ]; then echo "::error::no artifacts to release"; exit 1; fi
-          ls -la assets
-          gh release create "v$APP_VERSION" "${files[@]}" \
-            --repo "$TARGET" --title "Release v$APP_VERSION" --notes "Automated build release." \
-            || gh release upload "v$APP_VERSION" "${files[@]}" --repo "$TARGET" --clobber
-      - name: Job summary
-        run: |
-          {
-            echo "## Build v$APP_VERSION"
-            echo "Released to the private target repo. Artifacts:"
-            echo ""
-            for f in assets/*; do echo "- \`$(basename "$f")\`"; done
-          } >> "$GITHUB_STEP_SUMMARY"
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then echo "no linux files"; exit 0; fi
+          gh release upload "v$APP_VERSION" "${files[@]}" --repo "$TARGET" --clobber
+          { echo "### Linux/Docker/extension/APK artifacts (v$APP_VERSION)"; for f in "${files[@]}"; do echo "- \`$(basename "$f")\`"; done; } >> "$GITHUB_STEP_SUMMARY"
